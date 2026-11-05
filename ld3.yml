@@ -1,0 +1,449 @@
+---
+- name: Oracle Load and Root Cause Diagnostics
+  hosts: oracle_servers
+  gather_facts: true
+
+  vars:
+    oracle_user: oracle
+    load_threshold: 1.5
+    top_process_count: 10
+    report_dir: /tmp/oracle_diagnostics
+    report_file: "/tmp/oracle_diagnostics/oracle_rca_{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.txt"
+
+  tasks:
+
+    - name: Collect OS load and resources
+      shell: |
+        echo "HOST: $(hostname)"
+        echo "DATE: $(date)"
+        echo "CPU COUNT: $(nproc)"
+        echo "LOAD: $(cat /proc/loadavg)"
+        echo "UPTIME: $(uptime)"
+        echo "MEMORY:"
+        free -h
+        echo "VMSTAT:"
+        vmstat 1 3
+        echo "TOP PROCESSES:"
+        ps -eo pid,ppid,user,pcpu,pmem,comm,args --sort=-pcpu | head -20
+      args:
+        executable: /bin/bash
+      register: os_report
+      changed_when: false
+
+    - name: Check server load
+      shell: |
+        LOAD_AVG=$(awk '{print $1}' /proc/loadavg)
+        CPU_COUNT=$(nproc)
+        awk -v avg="$LOAD_AVG" -v cpu="$CPU_COUNT" \
+          -v threshold="{{ load_threshold }}" \
+          'BEGIN {
+            if (avg > cpu * threshold) print "HIGH_LOAD";
+            else print "NORMAL_LOAD";
+          }'
+      args:
+        executable: /bin/bash
+      register: load_status
+      changed_when: false
+
+    - name: Discover Oracle PMON and SID
+      shell: |
+        ps -eo pid=,args= |
+        awk '
+          {
+            for (i=2; i<=NF; i++) {
+              if ($i ~ /^ora_pmon_/) {
+                sid=$i
+                sub(/^ora_pmon_/, "", sid)
+                print sid "|" $1
+                exit
+              }
+            }
+          }'
+      args:
+        executable: /bin/bash
+      register: oracle_instance
+      changed_when: false
+      become: true
+      become_user: "{{ oracle_user }}"
+      become_flags: "-i"
+
+    - name: Validate Oracle instance
+      assert:
+        that:
+          - oracle_instance.stdout | trim | length > 0
+          - "'|' in oracle_instance.stdout"
+        fail_msg: "Oracle PMON not found."
+
+    - name: Set Oracle instance variables
+      set_fact:
+        oracle_sid: "{{ oracle_instance.stdout.split('|')[0] | trim }}"
+        oracle_pmon_pid: "{{ oracle_instance.stdout.split('|')[1] | trim }}"
+
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oracle
+        mode: '0750'
+      become: true
+      become_user: "{{ oracle_user }}"
+      become_flags: "-i"
+
+    - name: Initialize report
+      copy:
+        dest: "{{ report_file }}"
+        owner: "{{ oracle_user }}"
+        group: oracle
+        mode: '0640'
+        content: |
+          ==========================================
+          ORACLE ROOT CAUSE ANALYSIS
+          ==========================================
+          HOST: {{ inventory_hostname }}
+          DATE: {{ ansible_date_time.iso8601 }}
+
+          OS DIAGNOSTICS
+          {{ os_report.stdout }}
+
+          LOAD STATUS
+          {{ load_status.stdout }}
+
+          ORACLE SID: {{ oracle_sid }}
+          PMON PID: {{ oracle_pmon_pid }}
+      become: true
+      become_user: "{{ oracle_user }}"
+      become_flags: "-i"
+
+    - name: Collect Oracle database diagnostics
+      shell: |
+        set -u
+
+        REPORT="{{ report_file }}"
+        PMON_PID="{{ oracle_pmon_pid }}"
+        export ORACLE_SID="{{ oracle_sid }}"
+
+        ORACLE_BINARY=$(readlink -f "/proc/${PMON_PID}/exe")
+
+        if [ -z "$ORACLE_BINARY" ] || [ ! -x "$ORACLE_BINARY" ]; then
+          echo "Oracle executable not found"
+          exit 1
+        fi
+
+        export ORACLE_HOME=$(dirname "$(dirname "$ORACLE_BINARY")")
+        export PATH="$ORACLE_HOME/bin:/usr/bin:/bin"
+
+        if [ ! -x "$ORACLE_HOME/bin/sqlplus" ]; then
+          echo "SQLPLUS not found: $ORACLE_HOME/bin/sqlplus"
+          exit 1
+        fi
+
+        echo "ORACLE_HOME=$ORACLE_HOME" >> "$REPORT"
+        echo "ORACLE_SID=$ORACLE_SID" >> "$REPORT"
+
+        echo "==========================================" >> "$REPORT"
+        echo "ORACLE INSTANCE INFORMATION" >> "$REPORT"
+        echo "==========================================" >> "$REPORT"
+
+        "$ORACLE_HOME/bin/sqlplus" -L "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET PAGESIZE 500
+        SET LINESIZE 250
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+        SET TRIMSPOOL ON
+        SET FEEDBACK ON
+        SET VERIFY OFF
+        SET SERVEROUTPUT ON SIZE UNLIMITED
+
+        SELECT instance_name, host_name, version, status
+        FROM v\$instance;
+
+        EXIT;
+        SQL
+
+        DB_RC=$?
+        if [ "$DB_RC" -ne 0 ]; then
+          echo "Database connection failed: $DB_RC" >> "$REPORT"
+          exit "$DB_RC"
+        fi
+
+        # Find top Oracle CPU processes
+        TOP_PROCS=$(ps -eo pid=,pcpu=,user=,comm= --sort=-pcpu |
+          awk -v owner="{{ oracle_user }}" '
+            $3 == owner && ($4 == "oracle" || $4 ~ /^ora_/) {
+              print $1 "|" $2 "|" $4
+            }' | head -{{ top_process_count }})
+
+        echo "" >> "$REPORT"
+        echo "TOP ORACLE PROCESSES" >> "$REPORT"
+        printf "%s\n" "$TOP_PROCS" >> "$REPORT"
+
+        if [ -z "$TOP_PROCS" ]; then
+          echo "No Oracle processes found" >> "$REPORT"
+          exit 0
+        fi
+
+        while IFS='|' read -r PID CPU COMM
+        do
+          [ -z "$PID" ] && continue
+
+          echo "" >> "$REPORT"
+          echo "==========================================" >> "$REPORT"
+          echo "LINUX PID=$PID CPU=$CPU PROCESS=$COMM" >> "$REPORT"
+          echo "==========================================" >> "$REPORT"
+
+          if [ ! -d "/proc/$PID" ]; then
+            echo "Process no longer exists" >> "$REPORT"
+            continue
+          fi
+
+          "$ORACLE_HOME/bin/sqlplus" -L "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET PAGESIZE 500
+        SET LINESIZE 250
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+        SET TRIMSPOOL ON
+        SET VERIFY OFF
+        SET SERVEROUTPUT ON SIZE UNLIMITED
+
+        DEFINE os_pid = $PID
+
+        PROMPT 1. PID TO SESSION MAPPING
+
+        SELECT
+          p.spid,
+          p.pid AS oracle_pid,
+          p.program,
+          s.sid,
+          s.serial#,
+          s.username,
+          s.status,
+          s.sql_id,
+          s.sql_child_number,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.machine,
+          s.program AS client_program,
+          s.module
+        FROM v\$process p
+        LEFT JOIN v\$session s ON s.paddr = p.addr
+        WHERE p.spid = '&os_pid';
+
+        PROMPT 2. SESSION AND BLOCKING DETAILS
+
+        SELECT
+          s.sid,
+          s.serial#,
+          s.username,
+          s.status,
+          s.sql_id,
+          s.state,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.blocking_session,
+          s.final_blocking_session,
+          s.machine,
+          s.program,
+          s.module
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr = p.addr
+        WHERE p.spid = '&os_pid';
+
+        PROMPT 3. SQL TEXT
+
+        SELECT
+          s.sid,
+          s.sql_id,
+          s.sql_child_number,
+          q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr = p.addr
+        LEFT JOIN v\$sql q
+          ON q.sql_id = s.sql_id
+         AND q.child_number = s.sql_child_number
+        WHERE p.spid = '&os_pid';
+
+        PROMPT 4. SQL EXECUTION STATISTICS
+
+        SELECT
+          q.sql_id,
+          q.child_number,
+          q.plan_hash_value,
+          q.executions,
+          q.rows_processed,
+          q.buffer_gets,
+          q.disk_reads,
+          ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
+          ROUND(q.cpu_time/1000000,2) cpu_seconds,
+          q.px_servers_executions
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr = p.addr
+        JOIN v\$sql q
+          ON q.sql_id = s.sql_id
+         AND q.child_number = s.sql_child_number
+        WHERE p.spid = '&os_pid';
+
+        PROMPT 5. PARALLEL EXECUTION
+
+        SELECT
+          s.sid,
+          s.serial#,
+          s.sql_id,
+          CASE
+            WHEN px.sid IS NOT NULL THEN 'CURRENT PX SESSION'
+            WHEN NVL(q.px_servers_executions,0) > 0
+              THEN 'PX EXECUTIONS RECORDED'
+            ELSE 'NO PX EVIDENCE'
+          END execution_type,
+          px.qcsid,
+          px.server_group,
+          px.server_set,
+          px.server#,
+          q.px_servers_executions
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr = p.addr
+        LEFT JOIN v\$px_session px
+          ON px.sid = s.sid AND px.serial# = s.serial#
+        LEFT JOIN v\$sql q
+          ON q.sql_id = s.sql_id
+         AND q.child_number = s.sql_child_number
+        WHERE p.spid = '&os_pid';
+
+        PROMPT 6. PARALLEL COORDINATOR AND SLAVES
+
+        SELECT
+          sid, serial#, qcsid, qcinst_id,
+          server_group, server_set, server#, degree, req_degree
+        FROM v\$px_session
+        WHERE qcsid IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr = p.addr
+          WHERE p.spid = '&os_pid'
+        )
+        OR sid IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr = p.addr
+          WHERE p.spid = '&os_pid'
+        );
+
+        PROMPT 7. SQL EXECUTION PLAN
+
+        DECLARE
+          v_found NUMBER := 0;
+        BEGIN
+          FOR r IN (
+            SELECT DISTINCT s.sql_id, s.sql_child_number
+            FROM v\$process p
+            JOIN v\$session s ON s.paddr = p.addr
+            WHERE p.spid = '&os_pid'
+              AND s.sql_id IS NOT NULL
+          )
+          LOOP
+            v_found := 1;
+
+            DBMS_OUTPUT.PUT_LINE(
+              'SQL ID=' || r.sql_id ||
+              ' CHILD=' || r.sql_child_number
+            );
+
+            BEGIN
+              FOR pl IN (
+                SELECT plan_table_output
+                FROM TABLE(
+                  DBMS_XPLAN.DISPLAY_CURSOR(
+                    r.sql_id,
+                    r.sql_child_number,
+                    'TYPICAL'
+                  )
+                )
+              )
+              LOOP
+                DBMS_OUTPUT.PUT_LINE(pl.plan_table_output);
+              END LOOP;
+            EXCEPTION
+              WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('PLAN ERROR: ' || SQLERRM);
+            END;
+          END LOOP;
+
+          IF v_found = 0 THEN
+            DBMS_OUTPUT.PUT_LINE('No active SQL ID found.');
+          END IF;
+        END;
+        /
+
+        PROMPT 8. FINAL SESSION DETAILS
+
+        SELECT
+          p.spid,
+          p.pid,
+          s.sid,
+          s.serial#,
+          s.username,
+          s.sql_id,
+          s.event,
+          s.wait_class,
+          s.blocking_session
+        FROM v\$process p
+        LEFT JOIN v\$session s ON s.paddr = p.addr
+        WHERE p.spid = '&os_pid';
+
+        EXIT;
+        SQL
+
+          SQL_RC=$?
+          if [ "$SQL_RC" -ne 0 ]; then
+            echo "SQLPLUS ERROR FOR PID $PID RC=$SQL_RC" >> "$REPORT"
+          fi
+
+        done <<< "$TOP_PROCS"
+
+        echo "" >> "$REPORT"
+        echo "ORACLE ROOT CAUSE ANALYSIS COMPLETED" >> "$REPORT"
+        echo "REPORT=$REPORT"
+
+      args:
+        executable: /bin/bash
+      register: oracle_report
+      changed_when: false
+      failed_when: false
+      become: true
+      become_user: "{{ oracle_user }}"
+      become_flags: "-i"
+
+    - name: Display Oracle diagnostic output
+      debug:
+        var: oracle_report.stdout_lines
+
+    - name: Create local report directory
+      file:
+        path: "./oracle_reports/{{ inventory_hostname }}"
+        state: directory
+        mode: '0750'
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch RCA report to jump server
+      fetch:
+        src: "{{ report_file }}"
+        dest: "./oracle_reports/{{ inventory_hostname }}/"
+        flat: true
+      become: true
+      become_user: "{{ oracle_user }}"
+      become_flags: "-i"
+
+    - name: Final report summary
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Load status: {{ load_status.stdout }}"
+          - "Oracle SID: {{ oracle_sid }}"
+          - "PMON PID: {{ oracle_pmon_pid }}"
+          - "Report: ./oracle_reports/{{ inventory_hostname }}/"
