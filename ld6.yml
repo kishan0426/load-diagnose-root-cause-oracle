@@ -1,0 +1,378 @@
+
+---
+- name: Oracle Production RCA Diagnostics
+  hosts: oracle_servers
+  gather_facts: false
+  become: false
+
+  vars:
+    oracle_user: oracle
+    oracle_group: oracle
+    oracle_base: /opt/app/oracle
+    load_threshold: 1.5
+    top_process_count: 10
+    report_dir: /tmp/oracle_diagnostics
+
+  tasks:
+
+    - name: Generate timestamp
+      set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}"
+      delegate_to: localhost
+
+    - name: Set report filename
+      set_fact:
+        report_file: "{{ report_dir }}/oracle_rca_{{ inventory_hostname }}_{{ report_timestamp }}.txt"
+
+    - name: Collect OS diagnostics
+      shell: |
+        echo "HOST: $(hostname)"
+        echo "DATE: $(date)"
+        echo "CPU COUNT: $(nproc)"
+        echo "LOAD: $(cat /proc/loadavg)"
+        uptime
+        free -h
+        vmstat 1 3
+        ps -eo pid,ppid,user,pcpu,pmem,comm,args --sort=-pcpu | head -20
+      args:
+        executable: /bin/bash
+      register: os_report
+      changed_when: false
+
+    - name: Check load
+      shell: |
+        awk -v avg="$(awk '{print $1}' /proc/loadavg)" \
+            -v cpu="$(nproc)" \
+            -v threshold="{{ load_threshold }}" \
+            'BEGIN {if(avg > cpu*threshold) print "HIGH_LOAD"; else print "NORMAL_LOAD"}'
+      register: load_status
+      changed_when: false
+
+    - name: Discover Oracle PMON
+      shell: |
+        ps -eo pid=,args= |
+        awk '{
+          for(i=2;i<=NF;i++)
+            if($i ~ /^ora_pmon_/) {
+              sid=$i
+              sub(/^ora_pmon_/,"",sid)
+              print $1 "|" sid
+              exit
+            }
+        }'
+      args:
+        executable: /bin/bash
+      register: pmon
+      changed_when: false
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Validate PMON
+      assert:
+        that:
+          - pmon.stdout | trim | length > 0
+          - "'|' in pmon.stdout"
+        fail_msg: "Oracle PMON not found"
+
+    - name: Set Oracle SID and PMON PID
+      set_fact:
+        oracle_pmon_pid: "{{ pmon.stdout.split('|')[0] | trim }}"
+        oracle_sid: "{{ pmon.stdout.split('|')[1] | trim }}"
+
+    - name: Discover Oracle binary
+      shell: |
+        readlink -f /proc/{{ oracle_pmon_pid }}/exe
+      register: oracle_binary_result
+      changed_when: false
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Set Oracle Home
+      set_fact:
+        oracle_binary: "{{ oracle_binary_result.stdout | trim }}"
+        oracle_home: "{{ oracle_binary_result.stdout | trim | regex_replace('/bin/oracle$', '') }}"
+
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: '0750'
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Initialize report
+      copy:
+        dest: "{{ report_file }}"
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: '0640'
+        content: |
+          ==============================================
+          ORACLE ROOT CAUSE ANALYSIS
+          ==============================================
+          HOST: {{ inventory_hostname }}
+          DATE: {{ report_timestamp }}
+          ORACLE SID: {{ oracle_sid }}
+          PMON PID: {{ oracle_pmon_pid }}
+          ORACLE HOME: {{ oracle_home }}
+
+          OS DIAGNOSTICS
+          {{ os_report.stdout }}
+
+          LOAD STATUS
+          {{ load_status.stdout }}
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Collect Oracle diagnostics
+      shell: |
+        REPORT="{{ report_file }}"
+
+        export ORACLE_BASE="{{ oracle_base }}"
+        export ORACLE_HOME="{{ oracle_home }}"
+        export ORACLE_SID="{{ oracle_sid }}"
+        export PATH="$ORACLE_HOME/bin:/usr/local/bin:/usr/bin:/sbin:/bin"
+        export LD_LIBRARY_PATH="$ORACLE_HOME/lib"
+
+        SQLPLUS="$ORACLE_HOME/bin/sqlplus"
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "ORACLE ENVIRONMENT"
+          echo "=============================================="
+          id
+          env | egrep 'ORACLE|LD_LIBRARY_PATH|TNS_ADMIN|PATH'
+          ls -l "$ORACLE_HOME/bin/oracle"
+          ls -l "$SQLPLUS"
+          echo ""
+          echo "ORACLE LIBRARIES"
+          ldd "$ORACLE_HOME/bin/oracle"
+          echo ""
+          echo "SQLPLUS LIBRARIES"
+          ldd "$SQLPLUS"
+          echo ""
+          echo "FILESYSTEM"
+          findmnt -T "$ORACLE_HOME/bin/oracle"
+        } >> "$REPORT" 2>&1
+
+        if [ ! -x "$SQLPLUS" ]; then
+          echo "SQLPLUS NOT EXECUTABLE" >> "$REPORT"
+          exit 1
+        fi
+
+        echo "==============================================" >> "$REPORT"
+        echo "ORACLE CONNECTION TEST" >> "$REPORT"
+
+        "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER OSERROR EXIT FAILURE
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+
+        SET PAGESIZE 100
+        SET LINESIZE 200
+
+        SELECT instance_name, host_name, version, status
+        FROM v\$instance;
+
+        EXIT;
+        SQL
+
+        DB_RC=$?
+        echo "SQLPLUS RETURN CODE=$DB_RC" >> "$REPORT"
+
+        if [ "$DB_RC" -ne 0 ]; then
+          echo "SYSDBA CONNECTION FAILED" >> "$REPORT"
+          exit "$DB_RC"
+        fi
+
+        echo "SYSDBA CONNECTION SUCCESSFUL" >> "$REPORT"
+
+        # Top Oracle processes
+
+        TOP_PROCS=$(ps -eo pid=,pcpu=,user=,comm= --sort=-pcpu |
+          awk '$3=="oracle" && ($4=="oracle" || $4 ~ /^ora_/) {
+            print $1 "|" $2 "|" $4
+          }' | head -n {{ top_process_count }})
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "TOP ORACLE PROCESSES"
+          echo "=============================================="
+          printf "%s\n" "$TOP_PROCS"
+        } >> "$REPORT"
+
+        if [ -z "$TOP_PROCS" ]; then
+          echo "No Oracle processes found" >> "$REPORT"
+          exit 0
+        fi
+
+        while IFS='|' read -r PID CPU COMM
+        do
+          [ -z "$PID" ] && continue
+
+          {
+            echo ""
+            echo "=============================================="
+            echo "PID=$PID CPU=$CPU PROCESS=$COMM"
+            echo "=============================================="
+          } >> "$REPORT"
+
+          [ -d "/proc/$PID" ] || {
+            echo "Process disappeared" >> "$REPORT"
+            continue
+          }
+
+          "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET PAGESIZE 500
+        SET LINESIZE 250
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+        SET VERIFY OFF
+        SET SERVEROUTPUT ON SIZE UNLIMITED
+
+        DEFINE os_pid = $PID
+
+        PROMPT 1. PID SESSION MAPPING
+
+        SELECT
+          p.spid,p.pid,p.program,
+          s.sid,s.serial#,s.username,s.status,
+          s.sql_id,s.sql_child_number,
+          s.event,s.wait_class,s.seconds_in_wait,
+          s.machine,s.program,s.module
+        FROM v\$process p
+        LEFT JOIN v\$session s ON s.paddr=p.addr
+        WHERE p.spid='&os_pid';
+
+        PROMPT 2. BLOCKING DETAILS
+
+        SELECT
+          sid,serial#,username,status,sql_id,
+          event,wait_class,blocking_session,
+          final_blocking_session
+        FROM v\$session
+        WHERE sid IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          WHERE p.spid='&os_pid'
+        );
+
+        PROMPT 3. SQL TEXT
+
+        SELECT s.sql_id,q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='&os_pid';
+
+        PROMPT 4. SQL STATISTICS
+
+        SELECT
+          q.sql_id,q.child_number,q.plan_hash_value,
+          q.executions,q.rows_processed,
+          q.buffer_gets,q.disk_reads,
+          ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
+          ROUND(q.cpu_time/1000000,2) cpu_seconds,
+          q.px_servers_executions
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='&os_pid';
+
+        PROMPT 5. PARALLEL EXECUTION
+
+        SELECT
+          s.sid,s.serial#,s.sql_id,
+          px.qcsid,px.server_group,
+          px.server_set,px.server#,
+          q.px_servers_executions
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$px_session px
+          ON px.sid=s.sid AND px.serial#=s.serial#
+        LEFT JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='&os_pid';
+
+        PROMPT 6. EXECUTION PLAN
+
+        SELECT *
+        FROM TABLE(
+          DBMS_XPLAN.DISPLAY_CURSOR(
+            NULL,NULL,'TYPICAL'
+          )
+        );
+
+        EXIT;
+        SQL
+
+          SQL_RC=$?
+          if [ "$SQL_RC" -ne 0 ]; then
+            echo "SQLPLUS ERROR PID=$PID RC=$SQL_RC" >> "$REPORT"
+          fi
+
+        done <<< "$TOP_PROCS"
+
+        echo "ORACLE RCA COMPLETED" >> "$REPORT"
+        echo "REPORT=$REPORT"
+
+      args:
+        executable: /bin/bash
+      register: oracle_report
+      changed_when: false
+      failed_when: false
+      become: true
+      become_method: sudo
+      become_user: oracle
+      environment:
+        ORACLE_BASE: "{{ oracle_base }}"
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/usr/bin:/sbin:/bin"
+        LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+
+    - name: Display Oracle output
+      debug:
+        var: oracle_report.stdout_lines
+
+    - name: Create local report directory
+      file:
+        path: "./oracle_reports/{{ inventory_hostname }}"
+        state: directory
+        mode: '0750'
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch RCA report
+      fetch:
+        src: "{{ report_file }}"
+        dest: "./oracle_reports/{{ inventory_hostname }}/"
+        flat: true
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Final summary
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Load: {{ load_status.stdout }}"
+          - "Oracle SID: {{ oracle_sid }}"
+          - "Oracle Home: {{ oracle_home }}"
+          - "PMON PID: {{ oracle_pmon_pid }}"
+          - "Report: ./oracle_reports/{{ inventory_hostname }}/"
