@@ -1,0 +1,664 @@
+---
+- name: Oracle Production RCA Diagnostics
+  hosts: oracle_servers
+  gather_facts: false
+  become: false
+
+  vars:
+    oracle_user: oracle
+    oracle_group: oracle
+    oracle_base: /opt/app/oracle
+    load_threshold: 1.5
+    top_process_count: 10
+    report_dir: /tmp/oracle_diagnostics
+
+  tasks:
+
+    - name: Generate timestamp
+      set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}"
+      delegate_to: localhost
+
+    - name: Set report filename
+      set_fact:
+        report_file: "{{ report_dir }}/oracle_rca_{{ inventory_hostname }}_{{ report_timestamp }}.txt"
+
+    - name: Collect OS diagnostics
+      shell: |
+        echo "HOST: $(hostname)"
+        echo "DATE: $(date)"
+        echo "CPU COUNT: $(nproc)"
+        echo "LOAD: $(cat /proc/loadavg)"
+        uptime
+        free -h
+        vmstat 1 3
+        ps -eo pid,ppid,user,pcpu,pmem,comm,args --sort=-pcpu | head -20
+      args:
+        executable: /bin/bash
+      register: os_report
+      changed_when: false
+
+    - name: Check load
+      shell: |
+        awk -v avg="$(awk '{print $1}' /proc/loadavg)" \
+            -v cpu="$(nproc)" \
+            -v threshold="{{ load_threshold }}" \
+            'BEGIN {if(avg > cpu*threshold) print "HIGH_LOAD"; else print "NORMAL_LOAD"}'
+      register: load_status
+      changed_when: false
+
+    - name: Discover Oracle PMON
+      shell: |
+        ps -eo pid=,args= |
+        awk '{
+          for(i=2;i<=NF;i++)
+            if($i ~ /^ora_pmon_/) {
+              sid=$i
+              sub(/^ora_pmon_/,"",sid)
+              print $1 "|" sid
+              exit
+            }
+        }'
+      args:
+        executable: /bin/bash
+      register: pmon
+      changed_when: false
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Validate PMON
+      assert:
+        that:
+          - pmon.stdout | trim | length > 0
+          - "'|' in pmon.stdout"
+        fail_msg: "Oracle PMON not found"
+
+    - name: Set Oracle SID and PMON PID
+      set_fact:
+        oracle_pmon_pid: "{{ pmon.stdout.split('|')[0] | trim }}"
+        oracle_sid: "{{ pmon.stdout.split('|')[1] | trim }}"
+
+    - name: Discover Oracle binary
+      shell: |
+        readlink -f /proc/{{ oracle_pmon_pid }}/exe
+      register: oracle_binary_result
+      changed_when: false
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Set Oracle Home
+      set_fact:
+        oracle_binary: "{{ oracle_binary_result.stdout | trim }}"
+        oracle_home: "{{ oracle_binary_result.stdout | trim | regex_replace('/bin/oracle$', '') }}"
+
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: '0750'
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Initialize report
+      copy:
+        dest: "{{ report_file }}"
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: '0640'
+        content: |
+          ==============================================
+          ORACLE ROOT CAUSE ANALYSIS
+          ==============================================
+          HOST: {{ inventory_hostname }}
+          DATE: {{ report_timestamp }}
+          ORACLE SID: {{ oracle_sid }}
+          PMON PID: {{ oracle_pmon_pid }}
+          ORACLE HOME: {{ oracle_home }}
+
+          OS DIAGNOSTICS
+          {{ os_report.stdout }}
+
+          LOAD STATUS
+          {{ load_status.stdout }}
+      become: true
+      become_method: sudo
+      become_user: root
+    - name: Collect Oracle diagnostics
+      shell: |
+        REPORT="{{ report_file }}"
+
+        export ORACLE_BASE="{{ oracle_base }}"
+        export ORACLE_HOME="{{ oracle_home }}"
+        export ORACLE_SID="{{ oracle_sid }}"
+        export PATH="$ORACLE_HOME/bin:/usr/local/bin:/usr/bin:/sbin:/bin"
+        export LD_LIBRARY_PATH="$ORACLE_HOME/lib"
+
+        SQLPLUS="$ORACLE_HOME/bin/sqlplus"
+
+        {
+          echo "=============================================="
+          echo "ORACLE ENVIRONMENT"
+          echo "=============================================="
+          id
+          env | egrep 'ORACLE|LD_LIBRARY_PATH|TNS_ADMIN|PATH'
+          ldd "$ORACLE_HOME/bin/oracle"
+          ldd "$SQLPLUS"
+          findmnt -T "$ORACLE_HOME/bin/oracle"
+        } >> "$REPORT" 2>&1
+
+        if [ ! -x "$SQLPLUS" ]; then
+          echo "SQLPLUS NOT EXECUTABLE" >> "$REPORT"
+          exit 1
+        fi
+
+        "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER OSERROR EXIT FAILURE
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET PAGESIZE 100
+        SET LINESIZE 250
+
+        SELECT instance_name,host_name,version,status
+        FROM v\$instance;
+
+        SELECT name,value
+        FROM v\$parameter
+        WHERE name IN (
+          'parallel_degree_policy',
+          'parallel_max_servers',
+          'parallel_min_servers',
+          'parallel_servers_target',
+          'resource_manager_plan'
+        );
+
+        EXIT;
+        SQL
+
+        if [ $? -ne 0 ]; then
+          echo "SYSDBA CONNECTION FAILED" >> "$REPORT"
+          exit 1
+        fi
+
+        echo "SYSDBA CONNECTION SUCCESSFUL" >> "$REPORT"
+
+        # Identify top Oracle processes
+
+        TOP_PROCS=$(ps -eo pid=,pcpu=,user=,comm= --sort=-pcpu |
+          awk '$3=="oracle" && ($4=="oracle" || $4 ~ /^ora_/) {
+            print $1 "|" $2 "|" $4
+          }' | head -n {{ top_process_count }})
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "TOP ORACLE PROCESSES"
+          echo "=============================================="
+          printf "%s\n" "$TOP_PROCS"
+        } >> "$REPORT"
+
+        if [ -z "$TOP_PROCS" ]; then
+          echo "No Oracle processes found" >> "$REPORT"
+          exit 0
+        fi
+
+        while IFS='|' read -r PID CPU COMM
+        do
+          [ -z "$PID" ] && continue
+
+          echo "" >> "$REPORT"
+          echo "==============================================" >> "$REPORT"
+          echo "PID=$PID CPU=$CPU PROCESS=$COMM" >> "$REPORT"
+          echo "==============================================" >> "$REPORT"
+
+          [ -d "/proc/$PID" ] || {
+            echo "Process disappeared" >> "$REPORT"
+            continue
+          }
+
+          # Get exact Oracle process and session mapping
+
+          "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+        SET PAGESIZE 500
+        SET LINESIZE 300
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+        SET VERIFY OFF
+
+        PROMPT 1. PROCESS AND SESSION MAPPING
+
+        SELECT
+          p.spid,
+          p.pid oracle_pid,
+          p.program,
+          s.sid,
+          s.serial#,
+          s.username,
+          s.status,
+          s.sql_id,
+          s.sql_child_number,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.module,
+          s.action,
+          s.program session_program
+        FROM v\$process p
+        LEFT JOIN v\$session s ON s.paddr=p.addr
+        WHERE p.spid='&PID';
+
+        EXIT;
+        SQL
+
+          # ==================================================
+          # CASE 1: PARALLEL PROCESSES P000, P001, P002...
+          # ==================================================
+
+          if [[ "$COMM" =~ ^ora_p[0-9]+_ ]]; then
+
+            echo "CLASSIFICATION: PARALLEL EXECUTION PROCESS" >> "$REPORT"
+
+            "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+        SET PAGESIZE 500
+        SET LINESIZE 300
+
+        PROMPT 2.1 PARALLEL WORKER DETAILS
+
+        SELECT
+          p.spid,
+          s.sid,
+          s.serial#,
+          s.sql_id,
+          s.status,
+          s.event,
+          s.wait_class,
+          px.qcsid,
+          px.qcserial#,
+          px.qcinst_id,
+          px.server_group,
+          px.server_set,
+          px.server#,
+          px.degree,
+          px.req_degree
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$px_session px
+          ON px.sid=s.sid
+         AND px.serial#=s.serial#
+        WHERE p.spid='&PID';
+
+        PROMPT 2.2 ALL WORKERS FOR THE SAME COORDINATOR
+
+        SELECT
+          px.qcsid,
+          px.qcserial#,
+          px.sid,
+          px.serial#,
+          px.server_group,
+          px.server_set,
+          px.server#,
+          px.degree,
+          px.req_degree,
+          s.sql_id,
+          s.status,
+          s.event,
+          s.wait_class,
+          s.program
+        FROM v\$px_session px
+        LEFT JOIN v\$session s
+          ON s.sid=px.sid
+         AND s.serial#=px.serial#
+        WHERE px.qcsid = (
+          SELECT px.qcsid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          JOIN v\$px_session px
+            ON px.sid=s.sid
+           AND px.serial#=s.serial#
+          WHERE p.spid='&PID'
+        )
+        ORDER BY px.server_group,px.server_set,px.server#;
+
+        PROMPT 2.3 PARALLEL WORKER COUNTS
+
+        SELECT
+          qcsid,
+          COUNT(*) total_workers,
+          COUNT(DISTINCT server_group) server_groups,
+          COUNT(DISTINCT server_set) server_sets,
+          MAX(degree) degree,
+          MAX(req_degree) requested_degree
+        FROM v\$px_session
+        WHERE qcsid = (
+          SELECT px.qcsid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          JOIN v\$px_session px
+            ON px.sid=s.sid
+           AND px.serial#=s.serial#
+          WHERE p.spid='&PID'
+        )
+        GROUP BY qcsid;
+
+        PROMPT 2.4 PARALLEL SQL STATISTICS
+
+        SELECT
+          q.sql_id,
+          q.child_number,
+          q.plan_hash_value,
+          q.executions,
+          q.px_servers_executions,
+          q.buffer_gets,
+          q.disk_reads,
+          ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
+          ROUND(q.cpu_time/1000000,2) cpu_seconds
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        JOIN v\$sql q ON q.sql_id=s.sql_id
+        WHERE p.spid='&PID';
+
+        PROMPT 2.5 PARALLEL EXECUTION WAIT EVENTS
+
+        SELECT
+          s.sid,
+          s.serial#,
+          s.sql_id,
+          s.event,
+          s.wait_class,
+          s.state,
+          s.seconds_in_wait
+        FROM v\$px_session px
+        JOIN v\$session s
+          ON s.sid=px.sid
+         AND s.serial#=px.serial#
+        WHERE px.qcsid = (
+          SELECT px.qcsid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          JOIN v\$px_session px
+            ON px.sid=s.sid
+           AND px.serial#=s.serial#
+          WHERE p.spid='&PID'
+        );
+
+        EXIT;
+        SQL
+
+          # ==================================================
+          # CASE 2: JOB QUEUE PROCESSES J000, J001...
+          # ==================================================
+
+          elif [[ "$COMM" =~ ^ora_j[0-9]+_ ]]; then
+
+            echo "CLASSIFICATION: JOB QUEUE / SCHEDULER PROCESS" >> "$REPORT"
+
+            "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+        SET PAGESIZE 500
+        SET LINESIZE 300
+        SET LONG 100000
+
+        PROMPT 3.1 SCHEDULER RUNNING JOBS
+
+        SELECT
+          owner,
+          job_name,
+          session_id,
+          running_instance,
+          elapsed_time,
+          cpu_used,
+          resource_consumer_group
+        FROM dba_scheduler_running_jobs
+        WHERE session_id IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          WHERE p.spid='&PID'
+        );
+
+        PROMPT 3.2 AUTOTASK CLIENT CONFIGURATION
+
+        SELECT
+          client_name,
+          status,
+          consumer_group,
+          window_group
+        FROM dba_autotask_client;
+
+        PROMPT 3.3 AUTOTASK EXECUTION HISTORY
+
+        SELECT
+          client_name,
+          job_name,
+          job_status,
+          job_start_time,
+          job_duration
+        FROM dba_autotask_job_history
+        WHERE job_start_time > SYSDATE-2
+        ORDER BY job_start_time DESC;
+
+        PROMPT 3.4 AUTOMATIC MAINTENANCE WINDOWS
+
+        SELECT
+          window_name,
+          active,
+          enabled,
+          last_start_date,
+          next_start_date,
+          duration
+        FROM dba_autotask_window_clients;
+
+        PROMPT 3.5 RUNNING SCHEDULER JOB DETAILS
+
+        SELECT
+          owner,
+          job_name,
+          job_type,
+          job_action,
+          state,
+          last_start_date,
+          run_count,
+          failure_count
+        FROM dba_scheduler_jobs
+        WHERE job_name IN (
+          SELECT job_name
+          FROM dba_scheduler_running_jobs
+        );
+
+        PROMPT 3.6 RECENT AUTOTASK JOBS
+
+        SELECT
+          client_name,
+          window_name,
+          window_start_time,
+          window_duration,
+          job_status,
+          job_start_time,
+          job_duration
+        FROM dba_autotask_job_history
+        WHERE job_start_time > SYSDATE-1
+        ORDER BY job_start_time DESC;
+
+        PROMPT 3.7 PROCESS SQL DETAILS
+
+        SELECT
+          s.sid,
+          s.serial#,
+          s.sql_id,
+          s.prev_sql_id,
+          s.module,
+          s.action,
+          s.event,
+          q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$sql q ON q.sql_id=s.sql_id
+        WHERE p.spid='&PID';
+
+        EXIT;
+        SQL
+
+          # ==================================================
+          # CASE 3: NORMAL ORACLE PROCESS
+          # ==================================================
+
+          else
+
+            echo "CLASSIFICATION: NORMAL ORACLE PROCESS - SQL RCA" >> "$REPORT"
+
+            "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+        SET PAGESIZE 500
+        SET LINESIZE 300
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+
+        PROMPT 4.1 SESSION DETAILS
+
+        SELECT
+          p.spid,
+          s.sid,
+          s.serial#,
+          s.username,
+          s.status,
+          s.sql_id,
+          s.sql_child_number,
+          s.prev_sql_id,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.blocking_session,
+          s.final_blocking_session,
+          s.module,
+          s.action
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        WHERE p.spid='&PID';
+
+        PROMPT 4.2 SQL TEXT
+
+        SELECT
+          s.sql_id,
+          s.sql_child_number,
+          q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='&PID';
+
+        PROMPT 4.3 SQL EXECUTION STATISTICS
+
+        SELECT
+          q.sql_id,
+          q.child_number,
+          q.plan_hash_value,
+          q.executions,
+          q.rows_processed,
+          q.buffer_gets,
+          q.disk_reads,
+          ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
+          ROUND(q.cpu_time/1000000,2) cpu_seconds,
+          q.px_servers_executions
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='&PID';
+
+        PROMPT 4.4 BLOCKING SESSION DETAILS
+
+        SELECT
+          sid,
+          serial#,
+          username,
+          sql_id,
+          event,
+          wait_class,
+          blocking_instance,
+          blocking_session,
+          final_blocking_session
+        FROM v\$session
+        WHERE sid IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          WHERE p.spid='&PID'
+        );
+
+        PROMPT 4.5 EXECUTION PLAN
+
+        SELECT *
+        FROM TABLE(
+          DBMS_XPLAN.DISPLAY_CURSOR(
+            NULL,NULL,'TYPICAL'
+          )
+        );
+
+        EXIT;
+        SQL
+
+          fi
+
+          echo "COMPLETED PID=$PID PROCESS=$COMM" >> "$REPORT"
+
+        done <<< "$TOP_PROCS"
+
+        echo "ORACLE RCA COMPLETED" >> "$REPORT"
+        echo "REPORT=$REPORT"
+
+      args:
+        executable: /bin/bash
+      register: oracle_report
+      changed_when: false
+      failed_when: false
+      become: true
+      become_method: sudo
+      become_user: oracle
+      environment:
+        ORACLE_BASE: "{{ oracle_base }}"
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/usr/bin:/sbin:/bin"
+        LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    - name: Display Oracle output
+      debug:
+        var: oracle_report.stdout_lines
+
+    - name: Create local report directory
+      file:
+        path: "./oracle_reports/{{ inventory_hostname }}"
+        state: directory
+        mode: '0750'
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch RCA report
+      fetch:
+        src: "{{ report_file }}"
+        dest: "./oracle_reports/{{ inventory_hostname }}/"
+        flat: true
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Final summary
+      debug:
+        msg:
+          - "======================================"
+          - "ORACLE RCA COMPLETED"
+          - "======================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Load: {{ load_status.stdout }}"
+          - "Oracle SID: {{ oracle_sid }}"
+          - "Oracle Home: {{ oracle_home }}"
+          - "PMON PID: {{ oracle_pmon_pid }}"
+          - "Remote Report: {{ report_file }}"
+          - "Local Report: ./oracle_reports/{{ inventory_hostname }}/"
