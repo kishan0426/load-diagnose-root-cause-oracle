@@ -1,0 +1,1054 @@
+---
+- name: Oracle Production High CPU RCA
+  hosts: oracle_servers
+  gather_facts: false
+  become: false
+
+  vars:
+    oracle_user: oracle
+    oracle_group: oracle
+    oracle_base: /opt/app/oracle
+
+    report_dir: /tmp/oracle_diagnostics
+
+    # CPU monitoring
+    cpu_sample_count: 6
+    cpu_sample_interval: 5
+    min_active_samples: 4
+
+    # Investigate only top sustained CPU consumers
+    top_process_count: 3
+    process_cpu_threshold: 5.0
+
+  tasks:
+
+    - name: Generate timestamp
+      set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}"
+      delegate_to: localhost
+
+    - name: Set report filename
+      set_fact:
+        report_file: "{{ report_dir }}/oracle_rca_{{ inventory_hostname }}_{{ report_timestamp }}.txt"
+
+    - name: Discover all Oracle PMON processes
+      shell: |
+        ps -eo pid=,comm= |
+        awk '$2 ~ /^ora_pmon_/ {
+          sid=$2
+          sub(/^ora_pmon_/,"",sid)
+          print $1 "|" sid
+        }'
+      args:
+        executable: /bin/bash
+      register: pmon_list
+      changed_when: false
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Validate Oracle instances
+      assert:
+        that:
+          - pmon_list.stdout | trim | length > 0
+        fail_msg: "No Oracle database instances found"
+
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: '0750'
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Initialize RCA report
+      copy:
+        dest: "{{ report_file }}"
+        owner: "{{ oracle_user }}"
+        group: "{{ oracle_group }}"
+        mode: '0640'
+        content: |
+          ==============================================
+          ORACLE PRODUCTION HIGH CPU RCA
+          ==============================================
+
+          HOST: {{ inventory_hostname }}
+          DATE: {{ report_timestamp }}
+
+          DISCOVERED ORACLE DATABASES:
+          {{ pmon_list.stdout }}
+
+          MONITORING CONFIGURATION:
+
+          CPU SAMPLE COUNT: {{ cpu_sample_count }}
+          SAMPLE INTERVAL: {{ cpu_sample_interval }}
+          MINIMUM ACTIVE SAMPLES: {{ min_active_samples }}
+          TOP PROCESS COUNT: {{ top_process_count }}
+          CPU THRESHOLD: {{ process_cpu_threshold }}%
+
+          MODE: READ ONLY
+
+      become: true
+      become_method: sudo
+      become_user: root
+      - name: Monitor and identify sustained high CPU Oracle processes
+      shell: |
+        set -u
+
+        REPORT="{{ report_file }}"
+
+        SAMPLE_COUNT={{ cpu_sample_count }}
+        SAMPLE_INTERVAL={{ cpu_sample_interval }}
+        MIN_ACTIVE={{ min_active_samples }}
+        TOP_COUNT={{ top_process_count }}
+        CPU_THRESHOLD={{ process_cpu_threshold }}
+
+        CLK_TCK=$(getconf CLK_TCK)
+        CPU_COUNT=$(nproc)
+
+        declare -A FIRST_TICKS
+        declare -A LAST_TICKS
+        declare -A FIRST_TIME
+        declare -A LAST_TIME
+        declare -A OBSERVATIONS
+        declare -A PROC_NAME
+        declare -A PROC_SID
+        declare -A PMON_PID
+        declare -A ORACLE_HOMES
+        declare -A DB_CPU
+
+        # ==============================================
+        # DISCOVER ALL ORACLE DATABASES
+        # ==============================================
+
+        while IFS='|' read -r P SID
+        do
+          [ -z "$P" ] && continue
+
+          PMON_PID["$SID"]="$P"
+
+          BINARY=$(readlink -f "/proc/$P/exe" 2>/dev/null || true)
+
+          if [ -n "$BINARY" ]; then
+            ORACLE_HOMES["$SID"]=$(dirname "$(dirname "$BINARY")")
+          fi
+
+        done <<'PMON'
+        {{ pmon_list.stdout }}
+        PMON
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "ORACLE DATABASE INVENTORY"
+          echo "=============================================="
+
+          for SID in "${!PMON_PID[@]}"
+          do
+            echo "SID=$SID PMON=${PMON_PID[$SID]} HOME=${ORACLE_HOMES[$SID]:-UNKNOWN}"
+          done
+
+          echo "CPU COUNT=$CPU_COUNT"
+
+        } >> "$REPORT"
+
+        # ==============================================
+        # COLLECT CPU SNAPSHOTS
+        # ==============================================
+
+        collect_sample()
+        {
+          for PROC_DIR in /proc/[0-9]*
+          do
+            PID=${PROC_DIR##*/}
+
+            [ -r "$PROC_DIR/stat" ] || continue
+            [ -r "$PROC_DIR/comm" ] || continue
+
+            COMM=$(cat "$PROC_DIR/comm" 2>/dev/null) || continue
+
+            case "$COMM" in
+              oracle|ora_*) ;;
+              *) continue ;;
+            esac
+
+            STAT=$(cat "$PROC_DIR/stat" 2>/dev/null) || continue
+
+            REST=${STAT##*) }
+            read -ra FIELDS <<< "$REST"
+
+            [ "${#FIELDS[@]}" -lt 20 ] && continue
+
+            UTIME=${FIELDS[11]}
+            STIME=${FIELDS[12]}
+            START=${FIELDS[19]}
+
+            TICKS=$((UTIME + STIME))
+
+            KEY="${PID}_${START}"
+
+            SID="UNKNOWN"
+
+            # Oracle background process names generally
+            # contain the SID as their final component.
+
+            if [[ "$COMM" == ora_* ]]; then
+              SID=${COMM##*_}
+            else
+              CMDLINE=$(tr '\0' ' ' < "$PROC_DIR/cmdline" 2>/dev/null || true)
+
+              for DB in "${!PMON_PID[@]}"
+              do
+                if [[ "$CMDLINE" == *"oracle${DB}"* ]]; then
+                  SID="$DB"
+                  break
+                fi
+              done
+            fi
+
+            NOW=$SECONDS
+
+            if [ -z "${FIRST_TICKS[$KEY]+x}" ]; then
+              FIRST_TICKS[$KEY]=$TICKS
+              FIRST_TIME[$KEY]=$NOW
+              PROC_NAME[$KEY]="$COMM"
+              PROC_SID[$KEY]="$SID"
+              OBSERVATIONS[$KEY]=0
+            fi
+
+            LAST_TICKS[$KEY]=$TICKS
+            LAST_TIME[$KEY]=$NOW
+
+            OBSERVATIONS[$KEY]=$((OBSERVATIONS[$KEY] + 1))
+
+          done
+        }
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "SUSTAINED CPU MONITORING"
+          echo "=============================================="
+        } >> "$REPORT"
+
+        for ((I=1; I<=SAMPLE_COUNT; I++))
+        do
+          echo "SAMPLE $I / $SAMPLE_COUNT : $(date)" >> "$REPORT"
+
+          collect_sample
+
+          if [ "$I" -lt "$SAMPLE_COUNT" ]; then
+            sleep "$SAMPLE_INTERVAL"
+          fi
+        done
+
+        # ==============================================
+        # CALCULATE PROCESS CPU CONSUMPTION
+        # ==============================================
+
+        RANKED=""
+
+        for KEY in "${!FIRST_TICKS[@]}"
+        do
+          ACTIVE=${OBSERVATIONS[$KEY]}
+
+          # Exclude processes not observed consistently.
+
+          [ "$ACTIVE" -lt "$MIN_ACTIVE" ] && continue
+
+          DELTA=$((LAST_TICKS[$KEY] - FIRST_TICKS[$KEY]))
+          DURATION=$((LAST_TIME[$KEY] - FIRST_TIME[$KEY]))
+
+          [ "$DELTA" -le 0 ] && continue
+          [ "$DURATION" -le 0 ] && continue
+
+          CPU=$(awk \
+            -v d="$DELTA" \
+            -v t="$CLK_TCK" \
+            -v sec="$DURATION" \
+            'BEGIN {
+              printf "%.2f", (d/t/sec)*100
+            }')
+
+          if awk -v c="$CPU" -v t="$CPU_THRESHOLD" \
+            'BEGIN {exit !(c >= t)}'
+          then
+
+            PID=${KEY%%_*}
+            SID=${PROC_SID[$KEY]}
+
+            RANKED+="${PID}|${CPU}|${ACTIVE}|${PROC_NAME[$KEY]}|${SID}"$'\n'
+
+            DB_CPU["$SID"]=$(awk \
+              -v old="${DB_CPU[$SID]:-0}" \
+              -v new="$CPU" \
+              'BEGIN {printf "%.2f",old+new}')
+
+          fi
+
+        done
+
+        # ==============================================
+        # DATABASE-WISE CPU RANKING
+        # ==============================================
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "DATABASE-WISE CPU CONSUMPTION"
+          echo "=============================================="
+
+          for SID in "${!DB_CPU[@]}"
+          do
+            echo "DATABASE=$SID CPU=${DB_CPU[$SID]}%"
+          done
+
+        } >> "$REPORT"
+
+        # ==============================================
+        # SELECT TOP SUSTAINED CPU PROCESSES
+        # ==============================================
+
+        TOP_PROCS=$(printf '%s' "$RANKED" |
+          sort -t'|' -k2,2nr |
+          head -n "$TOP_COUNT")
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "TOP SUSTAINED CPU ORACLE PROCESSES"
+          echo "=============================================="
+
+          echo "PID | CPU% | SAMPLES | PROCESS | SID"
+
+          printf '%s\n' "$TOP_PROCS"
+
+        } >> "$REPORT"
+
+        if [ -z "$TOP_PROCS" ]; then
+          echo "No sustained Oracle CPU consumer exceeded threshold." >> "$REPORT"
+          echo "No detailed process investigation required." >> "$REPORT"
+          exit 0
+        fi
+
+        echo "SUSTAINED CPU PROCESS SELECTION COMPLETED" >> "$REPORT"
+
+        # Export selected process list for Part 3.
+        printf '%s\n' "$TOP_PROCS" > /tmp/oracle_rca_selected_{{ inventory_hostname }}_{{ report_timestamp }}
+
+      args:
+        executable: /bin/bash
+      register: cpu_monitor_result
+      changed_when: false
+      failed_when: false
+      become: true
+      become_method: sudo
+      become_user: oracle    - name: Monitor and identify sustained high CPU Oracle processes
+      shell: |
+        set -u
+
+        REPORT="{{ report_file }}"
+
+        SAMPLE_COUNT={{ cpu_sample_count }}
+        SAMPLE_INTERVAL={{ cpu_sample_interval }}
+        MIN_ACTIVE={{ min_active_samples }}
+        TOP_COUNT={{ top_process_count }}
+        CPU_THRESHOLD={{ process_cpu_threshold }}
+
+        CLK_TCK=$(getconf CLK_TCK)
+        CPU_COUNT=$(nproc)
+
+        declare -A FIRST_TICKS
+        declare -A LAST_TICKS
+        declare -A FIRST_TIME
+        declare -A LAST_TIME
+        declare -A OBSERVATIONS
+        declare -A PROC_NAME
+        declare -A PROC_SID
+        declare -A PMON_PID
+        declare -A ORACLE_HOMES
+        declare -A DB_CPU
+
+        # ==============================================
+        # DISCOVER ALL ORACLE DATABASES
+        # ==============================================
+
+        while IFS='|' read -r P SID
+        do
+          [ -z "$P" ] && continue
+
+          PMON_PID["$SID"]="$P"
+
+          BINARY=$(readlink -f "/proc/$P/exe" 2>/dev/null || true)
+
+          if [ -n "$BINARY" ]; then
+            ORACLE_HOMES["$SID"]=$(dirname "$(dirname "$BINARY")")
+          fi
+
+        done <<'PMON'
+        {{ pmon_list.stdout }}
+        PMON
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "ORACLE DATABASE INVENTORY"
+          echo "=============================================="
+
+          for SID in "${!PMON_PID[@]}"
+          do
+            echo "SID=$SID PMON=${PMON_PID[$SID]} HOME=${ORACLE_HOMES[$SID]:-UNKNOWN}"
+          done
+
+          echo "CPU COUNT=$CPU_COUNT"
+
+        } >> "$REPORT"
+
+        # ==============================================
+        # COLLECT CPU SNAPSHOTS
+        # ==============================================
+
+        collect_sample()
+        {
+          for PROC_DIR in /proc/[0-9]*
+          do
+            PID=${PROC_DIR##*/}
+
+            [ -r "$PROC_DIR/stat" ] || continue
+            [ -r "$PROC_DIR/comm" ] || continue
+
+            COMM=$(cat "$PROC_DIR/comm" 2>/dev/null) || continue
+
+            case "$COMM" in
+              oracle|ora_*) ;;
+              *) continue ;;
+            esac
+
+            STAT=$(cat "$PROC_DIR/stat" 2>/dev/null) || continue
+
+            REST=${STAT##*) }
+            read -ra FIELDS <<< "$REST"
+
+            [ "${#FIELDS[@]}" -lt 20 ] && continue
+
+            UTIME=${FIELDS[11]}
+            STIME=${FIELDS[12]}
+            START=${FIELDS[19]}
+
+            TICKS=$((UTIME + STIME))
+
+            KEY="${PID}_${START}"
+
+            SID="UNKNOWN"
+
+            # Oracle background process names generally
+            # contain the SID as their final component.
+
+            if [[ "$COMM" == ora_* ]]; then
+              SID=${COMM##*_}
+            else
+              CMDLINE=$(tr '\0' ' ' < "$PROC_DIR/cmdline" 2>/dev/null || true)
+
+              for DB in "${!PMON_PID[@]}"
+              do
+                if [[ "$CMDLINE" == *"oracle${DB}"* ]]; then
+                  SID="$DB"
+                  break
+                fi
+              done
+            fi
+
+            NOW=$SECONDS
+
+            if [ -z "${FIRST_TICKS[$KEY]+x}" ]; then
+              FIRST_TICKS[$KEY]=$TICKS
+              FIRST_TIME[$KEY]=$NOW
+              PROC_NAME[$KEY]="$COMM"
+              PROC_SID[$KEY]="$SID"
+              OBSERVATIONS[$KEY]=0
+            fi
+
+            LAST_TICKS[$KEY]=$TICKS
+            LAST_TIME[$KEY]=$NOW
+
+            OBSERVATIONS[$KEY]=$((OBSERVATIONS[$KEY] + 1))
+
+          done
+        }
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "SUSTAINED CPU MONITORING"
+          echo "=============================================="
+        } >> "$REPORT"
+
+        for ((I=1; I<=SAMPLE_COUNT; I++))
+        do
+          echo "SAMPLE $I / $SAMPLE_COUNT : $(date)" >> "$REPORT"
+
+          collect_sample
+
+          if [ "$I" -lt "$SAMPLE_COUNT" ]; then
+            sleep "$SAMPLE_INTERVAL"
+          fi
+        done
+
+        # ==============================================
+        # CALCULATE PROCESS CPU CONSUMPTION
+        # ==============================================
+
+        RANKED=""
+
+        for KEY in "${!FIRST_TICKS[@]}"
+        do
+          ACTIVE=${OBSERVATIONS[$KEY]}
+
+          # Exclude processes not observed consistently.
+
+          [ "$ACTIVE" -lt "$MIN_ACTIVE" ] && continue
+
+          DELTA=$((LAST_TICKS[$KEY] - FIRST_TICKS[$KEY]))
+          DURATION=$((LAST_TIME[$KEY] - FIRST_TIME[$KEY]))
+
+          [ "$DELTA" -le 0 ] && continue
+          [ "$DURATION" -le 0 ] && continue
+
+          CPU=$(awk \
+            -v d="$DELTA" \
+            -v t="$CLK_TCK" \
+            -v sec="$DURATION" \
+            'BEGIN {
+              printf "%.2f", (d/t/sec)*100
+            }')
+
+          if awk -v c="$CPU" -v t="$CPU_THRESHOLD" \
+            'BEGIN {exit !(c >= t)}'
+          then
+
+            PID=${KEY%%_*}
+            SID=${PROC_SID[$KEY]}
+
+            RANKED+="${PID}|${CPU}|${ACTIVE}|${PROC_NAME[$KEY]}|${SID}"$'\n'
+
+            DB_CPU["$SID"]=$(awk \
+              -v old="${DB_CPU[$SID]:-0}" \
+              -v new="$CPU" \
+              'BEGIN {printf "%.2f",old+new}')
+
+          fi
+
+        done
+
+        # ==============================================
+        # DATABASE-WISE CPU RANKING
+        # ==============================================
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "DATABASE-WISE CPU CONSUMPTION"
+          echo "=============================================="
+
+          for SID in "${!DB_CPU[@]}"
+          do
+            echo "DATABASE=$SID CPU=${DB_CPU[$SID]}%"
+          done
+
+        } >> "$REPORT"
+
+        # ==============================================
+        # SELECT TOP SUSTAINED CPU PROCESSES
+        # ==============================================
+
+        TOP_PROCS=$(printf '%s' "$RANKED" |
+          sort -t'|' -k2,2nr |
+          head -n "$TOP_COUNT")
+
+        {
+          echo ""
+          echo "=============================================="
+          echo "TOP SUSTAINED CPU ORACLE PROCESSES"
+          echo "=============================================="
+
+          echo "PID | CPU% | SAMPLES | PROCESS | SID"
+
+          printf '%s\n' "$TOP_PROCS"
+
+        } >> "$REPORT"
+
+        if [ -z "$TOP_PROCS" ]; then
+          echo "No sustained Oracle CPU consumer exceeded threshold." >> "$REPORT"
+          echo "No detailed process investigation required." >> "$REPORT"
+          exit 0
+        fi
+
+        echo "SUSTAINED CPU PROCESS SELECTION COMPLETED" >> "$REPORT"
+
+        # Export selected process list for Part 3.
+        printf '%s\n' "$TOP_PROCS" > /tmp/oracle_rca_selected_{{ inventory_hostname }}_{{ report_timestamp }}
+
+      args:
+        executable: /bin/bash
+      register: cpu_monitor_result
+      changed_when: false
+      failed_when: false
+      become: true
+      become_method: sudo
+      become_user: oracle
+    - name: Investigate selected high CPU Oracle processes
+      shell: |
+        set -u
+
+        REPORT="{{ report_file }}"
+
+        SELECTED="/tmp/oracle_rca_selected_{{ inventory_hostname }}_{{ report_timestamp }}"
+
+        [ -r "$SELECTED" ] || {
+          echo "Selected process list unavailable" >> "$REPORT"
+          exit 0
+        }
+
+        while IFS='|' read -r PID CPU ACTIVE COMM SID
+        do
+          [ -z "$PID" ] && continue
+
+          {
+            echo ""
+            echo "=============================================="
+            echo "HIGH CPU PROCESS INVESTIGATION"
+            echo "=============================================="
+            echo "PID=$PID"
+            echo "CPU=$CPU%"
+            echo "SAMPLES=$ACTIVE"
+            echo "PROCESS=$COMM"
+            echo "DATABASE=$SID"
+          } >> "$REPORT"
+
+          # Check process still exists.
+
+          if [ ! -d "/proc/$PID" ]; then
+            echo "PROCESS DISAPPEARED BEFORE INVESTIGATION" >> "$REPORT"
+            continue
+          fi
+
+          # Find the correct database Oracle Home.
+
+          PMON=$(ps -eo pid=,comm= |
+            awk -v sid="$SID" '
+              $2=="ora_pmon_"sid {print $1; exit}
+            ')
+
+          if [ -z "$PMON" ]; then
+            echo "DATABASE PMON NOT FOUND FOR SID=$SID" >> "$REPORT"
+            continue
+          fi
+
+          ORACLE_BINARY=$(readlink -f "/proc/$PMON/exe" 2>/dev/null || true)
+
+          if [ -z "$ORACLE_BINARY" ]; then
+            echo "ORACLE BINARY NOT FOUND" >> "$REPORT"
+            continue
+          fi
+
+          ORACLE_HOME=$(dirname "$(dirname "$ORACLE_BINARY")")
+
+          SQLPLUS="$ORACLE_HOME/bin/sqlplus"
+
+          if [ ! -x "$SQLPLUS" ]; then
+            echo "SQLPLUS NOT FOUND: $SQLPLUS" >> "$REPORT"
+            continue
+          fi
+
+          export ORACLE_HOME
+          export ORACLE_SID="$SID"
+          export ORACLE_BASE="{{ oracle_base }}"
+          export PATH="$ORACLE_HOME/bin:/usr/bin:/bin"
+          export LD_LIBRARY_PATH="$ORACLE_HOME/lib"
+
+          # ==========================================
+          # PID TO ORACLE SESSION MAPPING
+          # ==========================================
+
+          {
+            echo ""
+            echo "PID TO SESSION MAPPING"
+          } >> "$REPORT"
+
+          "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+
+        SET PAGESIZE 300
+        SET LINESIZE 300
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+        SET VERIFY OFF
+
+        SELECT
+          p.spid,
+          p.pid oracle_pid,
+          p.program,
+          s.sid,
+          s.serial#,
+          s.username,
+          s.status,
+          s.type,
+          s.sql_id,
+          s.sql_child_number,
+          s.prev_sql_id,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.module,
+          s.action,
+          s.machine
+        FROM v\$process p
+        LEFT JOIN v\$session s ON s.paddr=p.addr
+        WHERE p.spid='${PID}';
+
+        EXIT;
+        SQL
+
+          # ==========================================
+          # CASE 1: PARALLEL EXECUTION P000
+          # ==========================================
+
+          if [[ "$COMM" =~ ^ora_p[0-9]{3}_ ]]; then
+
+            echo "PROCESS TYPE: PARALLEL EXECUTION" >> "$REPORT"
+
+            "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+
+        SET PAGESIZE 300
+        SET LINESIZE 300
+
+        PROMPT PARALLEL WORKER DETAILS
+
+        SELECT
+          p.spid,
+          s.sid,
+          s.serial#,
+          s.sql_id,
+          s.status,
+          s.event,
+          s.wait_class,
+          px.qcsid,
+          px.qcserial#,
+          px.server_group,
+          px.server_set,
+          px.server#,
+          px.degree,
+          px.req_degree
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$px_session px
+          ON px.sid=s.sid
+         AND px.serial#=s.serial#
+        WHERE p.spid='${PID}';
+
+        PROMPT ALL WORKERS FOR SAME COORDINATOR
+
+        SELECT
+          px.qcsid,
+          px.qcserial#,
+          px.sid,
+          px.serial#,
+          px.server_group,
+          px.server_set,
+          px.server#,
+          px.degree,
+          px.req_degree,
+          s.sql_id,
+          s.status,
+          s.event,
+          s.wait_class,
+          s.program
+        FROM v\$px_session px
+        LEFT JOIN v\$session s
+          ON s.sid=px.sid
+         AND s.serial#=px.serial#
+        WHERE px.qcsid = (
+          SELECT px.qcsid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          JOIN v\$px_session px
+            ON px.sid=s.sid
+           AND px.serial#=s.serial#
+          WHERE p.spid='${PID}'
+        )
+        ORDER BY px.server_group,px.server_set,px.server#;
+
+        PROMPT PARALLEL SQL DETAILS
+
+        SELECT
+          s.sql_id,
+          s.sql_child_number,
+          q.plan_hash_value,
+          q.executions,
+          q.px_servers_executions,
+          q.buffer_gets,
+          q.disk_reads,
+          ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
+          ROUND(q.cpu_time/1000000,2) cpu_seconds,
+          q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='${PID}';
+
+        EXIT;
+        SQL
+
+          # ==========================================
+          # CASE 2: JOB QUEUE / AUTOTASK J000
+          # ==========================================
+
+          elif [[ "$COMM" =~ ^ora_j[0-9]{3}_ ]]; then
+
+            echo "PROCESS TYPE: SCHEDULER / AUTOTASK" >> "$REPORT"
+
+            "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+
+        SET PAGESIZE 300
+        SET LINESIZE 300
+
+        PROMPT SCHEDULER RUNNING JOBS
+
+        SELECT
+          owner,
+          job_name,
+          session_id,
+          running_instance,
+          elapsed_time,
+          cpu_used,
+          resource_consumer_group
+        FROM dba_scheduler_running_jobs
+        WHERE session_id IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          WHERE p.spid='${PID}'
+        );
+
+        PROMPT AUTOTASK CLIENT DETAILS
+
+        SELECT
+          client_name,
+          status,
+          consumer_group,
+          window_group
+        FROM dba_autotask_client;
+
+        PROMPT AUTOTASK JOB HISTORY
+
+        SELECT
+          client_name,
+          job_name,
+          job_status,
+          job_start_time,
+          job_duration
+        FROM dba_autotask_job_history
+        WHERE job_start_time > SYSDATE-1
+        ORDER BY job_start_time DESC;
+
+        PROMPT MAINTENANCE WINDOW CLIENTS
+
+        SELECT
+          window_name,
+          window_active,
+          autotask_status
+        FROM dba_autotask_window_clients;
+
+        PROMPT J000 SESSION SQL DETAILS
+
+        SELECT
+          s.sid,
+          s.serial#,
+          s.sql_id,
+          s.prev_sql_id,
+          s.module,
+          s.action,
+          s.event,
+          q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$sql q ON q.sql_id=s.sql_id
+        WHERE p.spid='${PID}';
+
+        EXIT;
+        SQL
+
+          # ==========================================
+          # CASE 3: NORMAL ORACLE PROCESS
+          # ==========================================
+
+          else
+
+            echo "PROCESS TYPE: NORMAL ORACLE PROCESS" >> "$REPORT"
+
+            "$SQLPLUS" -L -S "/ as sysdba" >> "$REPORT" 2>&1 <<SQL
+        WHENEVER SQLERROR CONTINUE
+
+        SET PAGESIZE 300
+        SET LINESIZE 300
+        SET LONG 100000
+        SET LONGCHUNKSIZE 100000
+
+        PROMPT SQL SESSION DETAILS
+
+        SELECT
+          p.spid,
+          s.sid,
+          s.serial#,
+          s.username,
+          s.status,
+          s.sql_id,
+          s.sql_child_number,
+          s.prev_sql_id,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.blocking_instance,
+          s.blocking_session,
+          s.final_blocking_session,
+          s.module,
+          s.action
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        WHERE p.spid='${PID}';
+
+        PROMPT SQL TEXT
+
+        SELECT
+          s.sql_id,
+          s.sql_child_number,
+          q.sql_text
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        LEFT JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='${PID}';
+
+        PROMPT SQL EXECUTION STATISTICS
+
+        SELECT
+          q.sql_id,
+          q.child_number,
+          q.plan_hash_value,
+          q.executions,
+          q.rows_processed,
+          q.buffer_gets,
+          q.disk_reads,
+          ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
+          ROUND(q.cpu_time/1000000,2) cpu_seconds
+        FROM v\$process p
+        JOIN v\$session s ON s.paddr=p.addr
+        JOIN v\$sql q
+          ON q.sql_id=s.sql_id
+         AND q.child_number=s.sql_child_number
+        WHERE p.spid='${PID}';
+
+        PROMPT BLOCKING DETAILS
+
+        SELECT
+          sid,
+          serial#,
+          username,
+          sql_id,
+          event,
+          wait_class,
+          blocking_instance,
+          blocking_session,
+          final_blocking_session
+        FROM v\$session
+        WHERE sid IN (
+          SELECT s.sid
+          FROM v\$process p
+          JOIN v\$session s ON s.paddr=p.addr
+          WHERE p.spid='${PID}'
+        );
+
+        EXIT;
+        SQL
+
+          fi
+
+          echo "PROCESS INVESTIGATION COMPLETED: PID=$PID SID=$SID" >> "$REPORT"
+
+        done < "$SELECTED"
+
+        echo "ALL SELECTED PROCESS INVESTIGATIONS COMPLETED" >> "$REPORT"
+
+      args:
+        executable: /bin/bash
+      register: oracle_investigation
+      changed_when: false
+      failed_when: false
+      become: true
+      become_method: sudo
+      become_user: oracle
+      environment:
+      ORACLE_BASE: "{{ oracle_base }}"
+    - name: Complete Oracle RCA report
+      shell: |
+        {
+          echo ""
+          echo "=============================================="
+          echo "ORACLE PRODUCTION RCA COMPLETED"
+          echo "=============================================="
+          echo "HOST: {{ inventory_hostname }}"
+          echo "DATE: $(date)"
+          echo "REPORT: {{ report_file }}"
+          echo "MODE: READ ONLY"
+        } >> "{{ report_file }}"
+
+        rm -f "/tmp/oracle_rca_selected_{{ inventory_hostname }}_{{ report_timestamp }}"
+
+      args:
+        executable: /bin/bash
+      changed_when: false
+      become: true
+      become_method: sudo
+      become_user: oracle
+
+    - name: Create local report directory
+      file:
+        path: "./oracle_reports/{{ inventory_hostname }}"
+        state: directory
+        mode: '0750'
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch Oracle RCA report
+      fetch:
+        src: "{{ report_file }}"
+        dest: "./oracle_reports/{{ inventory_hostname }}/"
+        flat: true
+      become: true
+      become_method: sudo
+      become_user: root
+
+    - name: Display RCA execution summary
+      debug:
+        msg:
+          - "=============================================="
+          - "ORACLE PRODUCTION RCA COMPLETED"
+          - "=============================================="
+          - "Host: {{ inventory_hostname }}"
+          - "Oracle databases discovered: {{ pmon_list.stdout_lines | length }}"
+          - "CPU samples: {{ cpu_sample_count }}"
+          - "Sample interval: {{ cpu_sample_interval }} seconds"
+          - "Minimum active samples: {{ min_active_samples }}"
+          - "Top processes investigated: {{ top_process_count }}"
+          - "CPU threshold: {{ process_cpu_threshold }}%"
+          - "Remote report: {{ report_file }}"
+          - "Local report: ./oracle_reports/{{ inventory_hostname }}/"
+          - "Mode: READ ONLY"
