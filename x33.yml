@@ -735,7 +735,6 @@
           p.program,
           p.background,
           p.serial# AS process_serial,
-
           s.sid,
           s.serial# AS session_serial,
           s.username,
@@ -753,12 +752,9 @@
           s.action,
           s.machine,
           s.program AS session_program
-
         FROM v\$process p
-
         LEFT JOIN v\$session s
           ON s.paddr=p.addr
-
         WHERE p.spid='&PID';
 
         PROMPT 11.3 CURRENT SQL DETAILS
@@ -777,18 +773,13 @@
           s.module,
           s.action,
           q.sql_text
-
         FROM v\$process p
-
         LEFT JOIN v\$session s
           ON s.paddr=p.addr
-
         LEFT JOIN v\$sql q
           ON q.sql_id=s.sql_id
          AND q.child_number=s.sql_child_number
-
         WHERE p.spid='&PID';
-
         PROMPT 11.4 PREVIOUS SQL DETAILS
 
         SELECT
@@ -797,15 +788,11 @@
           s.serial#,
           s.prev_sql_id,
           q.sql_text
-
         FROM v\$process p
-
         JOIN v\$session s
           ON s.paddr=p.addr
-
         LEFT JOIN v\$sql q
           ON q.sql_id=s.prev_sql_id
-
         WHERE p.spid='&PID';
 
         PROMPT 11.5 SQL EXECUTION STATISTICS
@@ -824,18 +811,14 @@
           ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
           ROUND(q.cpu_time/1000000,2) cpu_seconds,
           q.px_servers_executions
-
         FROM v\$process p
-
         JOIN v\$session s
           ON s.paddr=p.addr
-
         JOIN v\$sql q
           ON q.sql_id=s.sql_id
          AND q.child_number=s.sql_child_number
-
         WHERE p.spid='&PID';
-
+        
         PROMPT 11.6 BLOCKING SESSION DETAILS
 
         SELECT
@@ -848,20 +831,13 @@
           blocking_instance,
           blocking_session,
           final_blocking_session
-
         FROM v\$session
-
         WHERE sid IN (
-
           SELECT s.sid
-
           FROM v\$process p
-
           JOIN v\$session s
             ON s.paddr=p.addr
-
           WHERE p.spid='&PID'
-
         );
 
         PROMPT 11.7 SQL EXECUTION PLAN
@@ -915,16 +891,12 @@
           px.server#,
           px.degree,
           px.req_degree
-
         FROM v\$process p
-
         JOIN v\$session s
           ON s.paddr=p.addr
-
         LEFT JOIN v\$px_session px
           ON px.sid=s.sid
          AND px.serial#=s.serial#
-
         WHERE p.spid='&PID';
 
         PROMPT 11.8.2 ALL WORKERS FOR SAME COORDINATOR
@@ -945,28 +917,19 @@
           s.event,
           s.wait_class,
           s.program
-
         FROM v\$px_session px
-
         LEFT JOIN v\$session s
           ON s.sid=px.sid
          AND s.serial#=px.serial#
-
         WHERE px.qcsid = (
-
           SELECT px.qcsid
-
           FROM v\$process p
-
           JOIN v\$session s
             ON s.paddr=p.addr
-
           JOIN v\$px_session px
             ON px.sid=s.sid
            AND px.serial#=s.serial#
-
           WHERE p.spid='&PID'
-
         )
 
         ORDER BY px.server_group,px.server_set,px.server#;
@@ -980,26 +943,17 @@
           COUNT(DISTINCT server_set) server_sets,
           MAX(degree) degree,
           MAX(req_degree) requested_degree
-
         FROM v\$px_session
-
         WHERE qcsid = (
-
           SELECT px.qcsid
-
           FROM v\$process p
-
           JOIN v\$session s
             ON s.paddr=p.addr
-
           JOIN v\$px_session px
             ON px.sid=s.sid
            AND px.serial#=s.serial#
-
           WHERE p.spid='&PID'
-
         )
-
         GROUP BY qcsid;
 
         PROMPT 11.8.4 PARALLEL SQL STATISTICS
@@ -1014,16 +968,12 @@
           q.disk_reads,
           ROUND(q.elapsed_time/1000000,2) elapsed_seconds,
           ROUND(q.cpu_time/1000000,2) cpu_seconds
-
         FROM v\$process p
-
         JOIN v\$session s
           ON s.paddr=p.addr
-
         JOIN v\$sql q
           ON q.sql_id=s.sql_id
          AND q.child_number=s.sql_child_number
-
         WHERE p.spid='&PID';
 
         PROMPT 11.8.5 PARALLEL EXECUTION WAIT EVENTS
@@ -1037,28 +987,19 @@
           s.wait_class,
           s.state,
           s.seconds_in_wait
-
         FROM v\$px_session px
-
         JOIN v\$session s
           ON s.sid=px.sid
          AND s.serial#=px.serial#
-
         WHERE px.qcsid = (
-
           SELECT px.qcsid
-
           FROM v\$process p
-
           JOIN v\$session s
             ON s.paddr=p.addr
-
           JOIN v\$px_session px
             ON px.sid=s.sid
            AND px.serial#=s.serial#
-
           WHERE p.spid='&PID'
-
         );
 
         EXIT;
@@ -1092,20 +1033,13 @@
           elapsed_time,
           cpu_used,
           resource_consumer_group
-
         FROM dba_scheduler_running_jobs
-
         WHERE session_id IN (
-
           SELECT s.sid
-
           FROM v\$process p
-
           JOIN v\$session s
             ON s.paddr=p.addr
-
           WHERE p.spid='&PID'
-
         );
 
         PROMPT 11.9.2 AUTOTASK CONFIGURATION
@@ -1115,7 +1049,6 @@
           status,
           consumer_group,
           window_group
-
         FROM dba_autotask_client;
 
         PROMPT 11.9.3 RECENT AUTOTASK HISTORY
@@ -1126,13 +1059,10 @@
           job_status,
           job_start_time,
           job_duration
-
         FROM dba_autotask_job_history
-
         WHERE job_start_time > SYSDATE-2
-
         ORDER BY job_start_time DESC;
-
+        
         PROMPT 11.9.4 SCHEDULER JOB DETAILS
 
         SELECT
@@ -1144,14 +1074,10 @@
           last_start_date,
           run_count,
           failure_count
-
         FROM dba_scheduler_jobs
-
         WHERE job_name IN (
-
           SELECT job_name
           FROM dba_scheduler_running_jobs
-
         );
 
         PROMPT 11.9.5 PROCESS SQL DETAILS
@@ -1165,17 +1091,13 @@
           s.action,
           s.event,
           q.sql_text
-
         FROM v\$process p
-
         JOIN v\$session s
           ON s.paddr=p.addr
-
         LEFT JOIN v\$sql q
           ON q.sql_id=s.sql_id
-
         WHERE p.spid='&PID';
-
+        
         EXIT;
         SQL
 
